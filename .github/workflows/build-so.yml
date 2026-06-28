@@ -1,0 +1,62 @@
+name: Build libbionic_fg.so (arm64-v8a)
+
+# Standalone NDK build of the bionic-fg Vulkan frame-generation layer directly
+# from this fork (no Bannerlator submodule, no external patch — the single-device
+# fixes + manifest disable_environment are already committed in source on this
+# branch). Produces libbionic_fg.so + the implicit-layer manifest as an artifact
+# for manual injection into an installed app. Toolchain matches the app build
+# (NDK 26.1.10909125, android-26, arm64-v8a).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/fsr3-optical-flow-model
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Install NDK + CMake
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$SDK_ROOT"
+          if [ ! -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            curl -sL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools/
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            mv /tmp/cmdline-tools/cmdline-tools "$SDK_ROOT/cmdline-tools/latest" 2>/dev/null || true
+            rm -f /tmp/cmdline-tools.zip
+          fi
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.1.10909125" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
+
+      - name: Configure (arm64-v8a, android-26)
+        run: |
+          cmake -S . -B build \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Stage artifact (so + layer manifest)
+        run: |
+          mkdir -p out
+          cp build/libbionic_fg.so out/
+          cp VkLayer_BIONIC_framegen.json out/
+          ls -lh out/
+          echo "--- staged manifest ---"; cat out/VkLayer_BIONIC_framegen.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbionic_fg-arm64-track3
+          path: out/
