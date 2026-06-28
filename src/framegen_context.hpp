@@ -20,6 +20,8 @@ namespace bionic_fg {
 struct SynthUBO { float flowScale; float alpha; float epsilon; };
 struct FlowUBO   { float flowScale; float pad0; float pad1; float pad2; };
 struct PyramidUBO{ uint32_t scale; uint32_t aspect; uint32_t pad0; uint32_t pad1; };
+// model 3 (FSR3 Optical Flow): per-pyramid-level uniform for the SAD flow pass.
+struct Model3UBO { float flowScale; uint32_t level; uint32_t pad0; uint32_t pad1; };
 
 // ─── Pass ────────────────────────────────────────────────────────────────────
 
@@ -163,6 +165,14 @@ private:
     std::vector<Pass> model1GraphPasses_;       // runtime-confirmed model1 dispatch graph
     std::vector<VkExtent2D> model1GraphDispatch_; // per-pass group counts
     size_t model1FinalPassStart_ = 0;
+
+    // ── Model 3 (FSR3 Optical Flow) front-end ────────────────────────────────
+    // Pyramidal SAD optical flow (FidelityFX-SDK adaptation) that fills
+    // flowExpA_/flowExpB_ for the shared model-0 warp/blend + synthesis back end.
+    std::vector<vk::Image>  model3Images_;       // luma pyramids + flow scratch
+    std::vector<Pass>       model3Passes_;       // OF dispatch graph
+    std::vector<VkExtent2D> model3Dispatch_;     // per-pass group counts
+    std::vector<vk::Buffer> uboModel3_;          // per-level Model3UBO
 
     // ── UBO buffers ──────────────────────────────────────────────────────────
     vk::Buffer uboPyramid_;

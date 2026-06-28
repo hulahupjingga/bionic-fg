@@ -13,6 +13,9 @@ struct Config {
     //        2 = "V2 engine" — the model-1 graph rebuilt with libGameScopeV2.so
     //            shader variants substituted where a V2 variant exists
     //            (see embedded::kV2ShaderMap). model 2 is UNVERIFIED on device.
+    //        3 = "FSR3 Optical Flow" — a color-only FidelityFX-SDK OF front-end
+    //            (luma pyramid + SAD block flow) feeding the model-0 warp/blend +
+    //            synthesis back half. UNVERIFIED on device.
     uint32_t model = 0;
 
     void sanitize() {
@@ -20,7 +23,7 @@ struct Config {
         if (multiplier > 4) multiplier = 4;
         if (flowScale < 0.2f) flowScale = 0.2f;
         if (flowScale > 1.0f) flowScale = 1.0f;
-        if (model > 2) model = 2;
+        if (model > 3) model = 3;
     }
 };
 

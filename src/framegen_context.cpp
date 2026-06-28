@@ -123,6 +123,27 @@ static void clearImageWhite(const vk::Device& dev, const vk::CommandPool& pool, 
     cb.destroy(dev, pool);
 }
 
+// Clear an image to all-zeros and leave it in GENERAL (model 3 zero predictor).
+static void clearImageBlack(const vk::Device& dev, const vk::CommandPool& pool, vk::Image& img) {
+    vk::CommandBuffer cb(dev, pool);
+    cb.begin();
+    vk::imageBarrier(cb.handle(), img.handle(),
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    img.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkClearColorValue c{}; c.float32[0]=c.float32[1]=c.float32[2]=c.float32[3]=0.0f;
+    VkImageSubresourceRange r{}; r.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT; r.levelCount=1; r.layerCount=1;
+    vkCmdClearColorImage(cb.handle(), img.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &r);
+    vk::imageBarrier(cb.handle(), img.handle(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    img.layout = VK_IMAGE_LAYOUT_GENERAL;
+    cb.end(); cb.submitAndWait(dev);
+    cb.destroy(dev, pool);
+}
+
 // Build a single-sampled + single-storage pass (most feature passes use this).
 static Pass make1Tex1Img(const vk::Device& dev, VkDescriptorPool pool,
                          int shaderIdx, uint32_t sampledBinding, uint32_t storageBinding,
@@ -214,6 +235,11 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         // intended for device-side A/B testing.
         const bool useModel1 = (ctx->cfg_.model == 1 || ctx->cfg_.model == 2);
         const bool useV2     = (ctx->cfg_.model == 2);
+        // model 3 ("FSR3 Optical Flow"): a color-only pyramidal SAD optical-flow
+        // front-end (FidelityFX-SDK adaptation) that replaces model-0's flow
+        // estimation (stages 1-5) but reuses the model-0 warp/blend + synthesis
+        // back half (stage 6). It is additive: models 0/1/2 are unaffected.
+        const bool useModel3 = (ctx->cfg_.model == 3);
         // resolveShader: returns the V2-variant pooled index for a base role
         // index when model==2 and a mapping exists, else the base index itself.
         // Only the SPIR-V blob choice is affected; storage-format and UBO
@@ -602,8 +628,105 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             }
         }
 
+        // ── Model 3: FSR3 Optical Flow front-end ─────────────────────────────
+        // Builds a luma pyramid for prev+curr, runs a coarse-to-fine SAD block
+        // flow search, and scales the result to full-res forward/backward flow
+        // (flowExpA_/flowExpB_) for the shared model-0 warp/blend + synthesis
+        // back half built below. Color-only (no MV/depth); see NOTICE +
+        // per-shader DEVIATION comments. Resources kept in GENERAL like model 1.
+        if (useModel3) {
+            constexpr uint32_t kLevels = 5; // pyramid levels 0..4 (0 = full res)
+            auto levelExtent = [&](uint32_t lvl) -> VkExtent2D {
+                return {std::max(1u, W >> lvl), std::max(1u, H >> lvl)};
+            };
+            auto groupsFor3 = [](VkExtent2D e) -> VkExtent2D {
+                return {std::max(1u, (e.width + 15u) / 16u),
+                        std::max(1u, (e.height + 15u) / 16u)};
+            };
+
+            // Image roles (indices into model3Images_):
+            //   0..4   curr luma pyramid (level 0..4, R32F)
+            //   5..9   prev luma pyramid (level 0..4, R32F)
+            //   10     zero predictor for the coarsest flow level (RGBA16F)
+            //   11..14 flow at level 4,3,2,1 (full-res-pixel units, RGBA16F)
+            const uint32_t kZeroIdx  = 2 * kLevels;       // 10
+            const uint32_t kFlowBase = kZeroIdx + 1;      // 11 = flow level 4
+            ctx->model3Images_.reserve(2 * kLevels + 1 + (kLevels - 1));
+
+            auto addImg = [&](VkFormat fmt, VkExtent2D e, bool clearDst) -> uint32_t {
+                vk::ImageInfo info; info.extent = e; info.format = fmt;
+                info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                if (clearDst) info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                const uint32_t idx = static_cast<uint32_t>(ctx->model3Images_.size());
+                ctx->model3Images_.emplace_back(ctx->device_, info);
+                return idx;
+            };
+            for (uint32_t l = 0; l < kLevels; ++l) addImg(VK_FORMAT_R32_SFLOAT, levelExtent(l), false); // curr 0..4
+            for (uint32_t l = 0; l < kLevels; ++l) addImg(VK_FORMAT_R32_SFLOAT, levelExtent(l), false); // prev 5..9
+            addImg(VK_FORMAT_R16G16B16A16_SFLOAT, levelExtent(kLevels - 1), true);                       // zero 10
+            for (int l = static_cast<int>(kLevels) - 1; l >= 1; --l)
+                addImg(VK_FORMAT_R16G16B16A16_SFLOAT, levelExtent(static_cast<uint32_t>(l)), false);     // flow 11..14
+            clearImageBlack(ctx->device_, ctx->cmdPool_, ctx->model3Images_[kZeroIdx]);
+
+            // Per-level UBO for the 4 flow passes (levels 4,3,2,1).
+            ctx->uboModel3_.reserve(kLevels - 1);
+            for (int l = static_cast<int>(kLevels) - 1; l >= 1; --l) {
+                Model3UBO u; u.flowScale = cfg.flowScale; u.level = static_cast<uint32_t>(l);
+                u.pad0 = u.pad1 = 0;
+                ctx->uboModel3_.emplace_back(ctx->device_, sizeof(Model3UBO),
+                                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &u);
+            }
+
+            auto addM3 = [&](int shaderIdx, const vk::Buffer* ubo,
+                             const std::vector<const vk::Image*>& sampled,
+                             const std::vector<vk::Image*>& storage,
+                             VkExtent2D dispatchExtent) {
+                ctx->model3Passes_.push_back(
+                    makeModel1Pass(ctx->device_, ctx->descPool_, shaderIdx, ubo,
+                                   sampled, ctx->linearSampler_, storage));
+                ctx->model3Dispatch_.push_back(groupsFor3(dispatchExtent));
+            };
+
+            // 1) luma extract (curr + prev) at full res.
+            addM3(embedded::kModel3LumaIdx, nullptr, {&ctx->currFrame_},
+                  {&ctx->model3Images_[0]}, levelExtent(0));
+            addM3(embedded::kModel3LumaIdx, nullptr, {&ctx->prevFrame_},
+                  {&ctx->model3Images_[kLevels]}, levelExtent(0));
+            // 2) box-downsample both pyramids (level l-1 -> l).
+            for (uint32_t l = 1; l < kLevels; ++l)
+                addM3(embedded::kModel3DownsampleIdx, nullptr, {&ctx->model3Images_[l - 1]},
+                      {&ctx->model3Images_[l]}, levelExtent(l));
+            for (uint32_t l = 1; l < kLevels; ++l)
+                addM3(embedded::kModel3DownsampleIdx, nullptr, {&ctx->model3Images_[kLevels + l - 1]},
+                      {&ctx->model3Images_[kLevels + l]}, levelExtent(l));
+            // 3) coarse-to-fine SAD flow. Predictor = coarser flow (or zero @ lvl4).
+            //    sampled order {prevPyr, currPyr, predictor} == bindings 32,33,34.
+            uint32_t uboK = 0;
+            for (int l = static_cast<int>(kLevels) - 1; l >= 1; --l) {
+                const uint32_t lvl = static_cast<uint32_t>(l);
+                const uint32_t predIdx = (lvl == kLevels - 1)
+                    ? kZeroIdx : (kFlowBase + (kLevels - 2 - lvl)); // flow of lvl+1
+                const uint32_t outIdx  = kFlowBase + (kLevels - 1 - lvl);
+                addM3(embedded::kModel3FlowIdx, &ctx->uboModel3_[uboK++],
+                      {&ctx->model3Images_[kLevels + lvl], &ctx->model3Images_[lvl],
+                       &ctx->model3Images_[predIdx]},
+                      {&ctx->model3Images_[outIdx]}, levelExtent(lvl));
+            }
+            // 4) scale finest flow (level 1) to full-res forward/backward.
+            addM3(embedded::kModel3ExpandIdx, &ctx->uboFlow_,
+                  {&ctx->model3Images_[kFlowBase + (kLevels - 2)]},
+                  {&ctx->flowExpA_, &ctx->flowExpB_}, levelExtent(0));
+
+            BFG_LOGI("model=3 FSR3 Optical Flow: %zu OF passes, %zu images, %zu level-UBOs, %u pyramid levels (-> warp/blend+synth back half)",
+                     ctx->model3Passes_.size(), ctx->model3Images_.size(),
+                     ctx->uboModel3_.size(), kLevels);
+        }
+
         // ── Model-0 stages: skip entirely for model=1 (has its own graph above) ──
+        // For model 3, only stage 6 (warp/blend + synthesis) is reused; stages
+        // 1-5 are replaced by the FSR3 OF front-end built above.
         if (!useModel1) {
+        if (!useModel3) {
 
         // ── Stage 1: Pyramid (separate Pass per frame to avoid descriptor aliasing) ──
         {
@@ -748,7 +871,12 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             ctx->passFlowExpand_.bindStorage(ctx->device_, 49, ctx->flowExpB_);
         }
 
+        } // end !useModel3 (model-0 OF stages 1-5; model 3 supplies its own flow)
+
         // ── Stage 6: Confidence warp + synthesis ─────────────────────────────
+        // Shared back half: built for model 0 AND model 3. Both consume
+        // flowExpA_/flowExpB_ — model 0 fills them via stage 5, model 3 via its
+        // FSR3 OF expand pass.
         ctx->passWarpBlend_.reserve(outputs);
         ctx->passSynth_.reserve(outputs);
         for (uint32_t k = 0; k < outputs; ++k) {
@@ -809,7 +937,9 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
 
         BFG_LOGI("FramegenContext ready: %ux%u mult=%u model=%u graph=%s",
                   W, H, cfg.multiplier, cfg.model,
-                  useModel1 ? "model1-table" : "model0-full-of-chain");
+                  useModel1 ? "model1-table"
+                            : (useModel3 ? "model3-fsr3-of+warp/blend/synth"
+                                         : "model0-full-of-chain"));
         return ctx;
     } catch (const vk::VkError& e) {
         BFG_LOGE("FramegenContext::create VkError %d: %s", e.code, e.msg.c_str());
@@ -831,6 +961,26 @@ void FramegenContext::rebindFrameInputs() {
         for (size_t i = model1FinalPassStart_; i < model1GraphPasses_.size(); ++i) {
             model1GraphPasses_[i].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_); // shader_04 ext35
             model1GraphPasses_[i].bindSampledGeneral(device_, 33, currFrame_, linearSampler_); // shader_04 ext1
+        }
+        return;
+    }
+
+    // model 3: rebind only the FSR3 OF luma-extract inputs (passes 0=curr,
+    // 1=prev) plus the shared stage-6 warp/blend + synth inputs. The model-0
+    // pyramid/feature passes do not exist for model 3 (never built), so they
+    // must NOT be touched here.
+    if (cfg_.model == 3) {
+        if (model3Passes_.size() >= 2) {
+            model3Passes_[0].bindSampledGeneral(device_, 32, currFrame_, linearSampler_);
+            model3Passes_[1].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_);
+        }
+        for (auto& pw : passWarpBlend_) {
+            pw.bindSampled(device_, 32, prevFrame_, linearSampler_);
+            pw.bindSampled(device_, 33, currFrame_, linearSampler_);
+        }
+        for (auto& ps : passSynth_) {
+            ps.bindSampled(device_, 32, prevFrame_, linearSampler_);
+            ps.bindSampled(device_, 33, currFrame_, linearSampler_);
         }
         return;
     }
@@ -915,6 +1065,22 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
         return;
     }
 
+    // ── Model 3 (FSR3 OF) front-end OR model-0 stages 1-5 ────────────────────
+    // Both produce flowExpA_/flowExpB_ in SHADER_READ_ONLY_OPTIMAL for the
+    // shared stage-6 warp/blend + synthesis loop below.
+    const bool useModel3 = (cfg_.model == 3);
+    if (useModel3) {
+        for (auto& img : model3Images_) toStorage(cmd, img);
+        toStorage(cmd, flowExpA_); toStorage(cmd, flowExpB_);
+        const size_t n = std::min(model3Passes_.size(), model3Dispatch_.size());
+        for (size_t i = 0; i < n; ++i) {
+            const VkExtent2D g = model3Dispatch_[i];
+            model3Passes_[i].dispatch(cmd, g.width, g.height);
+            computeBarrier(cmd);
+        }
+        toShaderRead(cmd, flowExpA_); toShaderRead(cmd, flowExpB_);
+    } else {
+
     // ── Stage 1: Pyramid ─────────────────────────────────────────────────────
     for (int i=0;i<6;++i) { toStorage(cmd,pyramidA_[size_t(i)]); toStorage(cmd,pyramidB_[size_t(i)]); }
     passPyramidA_.dispatch(cmd, (W+15)/16, (H+15)/16);
@@ -974,7 +1140,9 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     passFlowExpand_.dispatch(cmd, (W+15)/16, (H+15)/16);  computeBarrier(cmd);
     toShaderRead(cmd,flowExpA_); toShaderRead(cmd,flowExpB_);
 
-    // ── Stage 6: Confidence warp + synthesis ────────────────────────────────
+    } // end model-0 stages 1-5 (else of useModel3)
+
+    // ── Stage 6: Confidence warp + synthesis (shared by model 0 and model 3) ─
     for (size_t k=0; k<passSynth_.size(); ++k) {
         toStorage(cmd, warpedPrev_);
         toStorage(cmd, warpedCurr_);
@@ -1035,6 +1203,9 @@ void FramegenContext::destroy() {
     for (auto& p:model1GraphPasses_) p.destroy(device_); model1GraphPasses_.clear();
     model1GraphDispatch_.clear();
     model1FinalPassStart_ = 0;
+    for (auto& p:model3Passes_) p.destroy(device_); model3Passes_.clear();
+    model3Dispatch_.clear();
+    for (auto& b:uboModel3_) b.destroy(device_); uboModel3_.clear();
     uboPyramid_.destroy(device_); uboFlow_.destroy(device_);
     for (auto& b:uboSynth_) b.destroy(device_); uboSynth_.clear();
     // Images
@@ -1051,6 +1222,7 @@ void FramegenContext::destroy() {
     confidence_.destroy(device_); warpedPrev_.destroy(device_);
     warpedCurr_.destroy(device_); confidenceMap_.destroy(device_);
     for (auto& i:model1Resources_) i.destroy(device_); model1Resources_.clear();
+    for (auto& i:model3Images_) i.destroy(device_); model3Images_.clear();
     if (descPool_) vkDestroyDescriptorPool(device_.handle(), descPool_, nullptr);
     descPool_ = VK_NULL_HANDLE;
     linearSampler_.destroy(device_); nearestSampler_.destroy(device_);
