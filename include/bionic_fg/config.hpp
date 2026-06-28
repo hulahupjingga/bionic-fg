@@ -9,6 +9,10 @@ struct Config {
     uint32_t height = 0;
     uint32_t multiplier = 2;
     float flowScale = 0.6f;
+    // model: 0 = model-0 hybrid OF chain, 1 = traced model-1 dispatch graph,
+    //        2 = "V2 engine" — the model-1 graph rebuilt with libGameScopeV2.so
+    //            shader variants substituted where a V2 variant exists
+    //            (see embedded::kV2ShaderMap). model 2 is UNVERIFIED on device.
     uint32_t model = 0;
 
     void sanitize() {
@@ -16,7 +20,7 @@ struct Config {
         if (multiplier > 4) multiplier = 4;
         if (flowScale < 0.2f) flowScale = 0.2f;
         if (flowScale > 1.0f) flowScale = 1.0f;
-        if (model > 1) model = 1;
+        if (model > 2) model = 2;
     }
 };
 

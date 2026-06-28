@@ -206,9 +206,30 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
     const uint32_t outputs = ctx->cfg_.multiplier - 1;
 
     try {
-        const bool useModel1 = ctx->cfg_.model == 1;
+        // model 1 and model 2 share the same traced dispatch graph. model 2
+        // ("V2 engine") rebuilds that exact graph but substitutes the
+        // libGameScopeV2.so shader variants for any role index that has one in
+        // embedded::kV2ShaderMap. NOTE: it is UNVERIFIED on device that the V2
+        // engine uses this identical dispatch graph; model 2 is additive and
+        // intended for device-side A/B testing.
+        const bool useModel1 = (ctx->cfg_.model == 1 || ctx->cfg_.model == 2);
+        const bool useV2     = (ctx->cfg_.model == 2);
+        // resolveShader: returns the V2-variant pooled index for a base role
+        // index when model==2 and a mapping exists, else the base index itself.
+        // Only the SPIR-V blob choice is affected; storage-format and UBO
+        // selection stay keyed on the base role index (V2 variants are
+        // index-aligned with the same binding layout).
+        int v2SwapCount = 0;
+        auto resolveShader = [&](int idx) -> int {
+            if (!useV2) return idx;
+            for (const auto& s : embedded::kV2ShaderMap) {
+                if (s.baseIdx == idx) { ++v2SwapCount; return s.v2PoolIdx; }
+            }
+            return idx;
+        };
         if (useModel1) {
-            BFG_LOGI("model=1 requested: using traced 100-dispatch graph (shader_03, 30..53, final 04), not model-0 hybrid fallback");
+            BFG_LOGI("model=%u requested: using traced 100-dispatch graph (shader_03, 30..53, final 04)%s, not model-0 hybrid fallback",
+                     ctx->cfg_.model, useV2 ? " with V2 shader variants" : "");
         }
 
         // Single-device mode: adopt the application's device (not owned) instead
@@ -442,8 +463,10 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 sampled.reserve(sampledLabels.size());
                 for (const auto& label : sampledLabels) sampled.push_back(resolveSample(label));
 
+                // storageFormatForShader/uboForShader stay keyed on the base
+                // role index; only the loaded SPIR-V is swapped for model 2.
                 ctx->model1GraphPasses_.push_back(
-                    makeModel1Pass(ctx->device_, ctx->descPool_, shaderIdx, uboForShader(shaderIdx),
+                    makeModel1Pass(ctx->device_, ctx->descPool_, resolveShader(shaderIdx), uboForShader(shaderIdx),
                                    sampled, ctx->linearSampler_, storage));
                 ctx->model1GraphDispatch_.push_back(groupsFor(passRatio));
             };
@@ -562,15 +585,21 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                     &resourceForD(dLabel(99, 48)),
                 };
                 std::vector<vk::Image*> storage = {&ctx->outputImages_[k]};
+                // shader 4 (final synthesis) has no V2 variant; resolveShader(4)
+                // returns 4 unchanged.
                 ctx->model1GraphPasses_.push_back(
-                    makeModel1Pass(ctx->device_, ctx->descPool_, 4, &ctx->uboSynth_[k],
+                    makeModel1Pass(ctx->device_, ctx->descPool_, resolveShader(4), &ctx->uboSynth_[k],
                                    sampled, ctx->linearSampler_, storage));
                 ctx->model1GraphDispatch_.push_back(groupsFor(ratio(1,1)));
             }
 
-            BFG_LOGI("model=1 graph: %zu passes, %zu resources, finalStart=%zu",
-                     ctx->model1GraphPasses_.size(), ctx->model1Resources_.size(),
+            BFG_LOGI("model=%u graph: %zu passes, %zu resources, finalStart=%zu",
+                     ctx->cfg_.model, ctx->model1GraphPasses_.size(), ctx->model1Resources_.size(),
                      ctx->model1FinalPassStart_);
+            if (useV2) {
+                BFG_LOGI("model=2 V2 engine: rebuilt model-1 graph with %d shader dispatch(es) swapped to libGameScopeV2.so variants (UNVERIFIED on device)",
+                         v2SwapCount);
+            }
         }
 
         // ── Model-0 stages: skip entirely for model=1 (has its own graph above) ──
@@ -794,7 +823,9 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
 }
 
 void FramegenContext::rebindFrameInputs() {
-    if (cfg_.model == 1) {
+    // model 2 (V2 engine) shares the model-1 graph layout, so it rebinds the
+    // same way.
+    if (cfg_.model == 1 || cfg_.model == 2) {
         if (!model1GraphPasses_.empty())
             model1GraphPasses_[0].bindSampledGeneral(device_, 32, currFrame_, linearSampler_); // shader_03 ext1
         for (size_t i = model1FinalPassStart_; i < model1GraphPasses_.size(); ++i) {
@@ -843,7 +874,9 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     if (prevFrame_.external()) vk::acquireFromExternal(cmd, prevFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
     if (currFrame_.external()) vk::acquireFromExternal(cmd, currFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
 
-    if (cfg_.model == 1) {
+    // model 2 (V2 engine) dispatches the identical model-1 graph (only the
+    // bound SPIR-V differs), so it takes this same path.
+    if (cfg_.model == 1 || cfg_.model == 2) {
         // Runtime-confirmed steady-state Model-1 order:
         // 0x1a9ed4 -> 0x1afe28(no compute) -> 0x1b004c -> 0x1b0708
         // -> 0x1b1b10(copy/barrier). We emit the internal dispatch graph plus
