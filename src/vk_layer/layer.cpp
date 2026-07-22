@@ -106,6 +106,17 @@ static constexpr int kMaxHotReloadGeneratedFrames = kMaxHotReloadMultiplier - 1;
 static constexpr uint32_t kHotReloadProvisionedSwapchainImages =
     static_cast<uint32_t>(kMaxHotReloadMultiplier + 1);
 
+// Headroom on top of the hot-reload provisioning. acquireGeneratedImage() acquires with a ZERO
+// timeout, so a generated frame is dropped outright whenever no swapchain image happens to be
+// free at that instant. A host-side FPS limiter throttles exactly the thing that frees images
+// (it delays the X11 Present IdleNotify), so the tighter the cap the more generated frames are
+// skipped — measured on Adreno 750: a 60 cap at 2x reached ~120 presented, while a 30 cap
+// produced a continuous stream of "generated frame acquire skipped: 1" (VK_NOT_READY) and no
+// multiplication at all. Deeper pools keep an image available across that slower recycle.
+// Requested opportunistically: the surface's maxImageCount is not consulted here, so creation
+// is retried at the original count if the driver rejects the deeper request.
+static constexpr uint32_t kLowCapExtraSwapchainImages = 3;
+
 static std::string trim(std::string s) {
     auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
@@ -891,8 +902,12 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
     // full 2x..4x hot-reload without requiring a swapchain recreation later.
     VkSwapchainCreateInfoKHR ci = *pCreateInfo;
     ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (conf.enabled)
-        ci.minImageCount = std::max(ci.minImageCount, kHotReloadProvisionedSwapchainImages);
+    const uint32_t requestedMinImages = ci.minImageCount;
+    if (conf.enabled) {
+        ci.minImageCount = std::max(ci.minImageCount,
+                                    kHotReloadProvisionedSwapchainImages
+                                        + kLowCapExtraSwapchainImages);
+    }
 
     // Retire old swapchain state if recreating
     if (pCreateInfo->oldSwapchain) {
@@ -904,6 +919,23 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
     }
 
     VkResult res = dd.createSwapchain(device, &ci, pAllocator, pSwapchain);
+    if (res != VK_SUCCESS && conf.enabled
+        && ci.minImageCount > kHotReloadProvisionedSwapchainImages) {
+        // The deeper pool is opportunistic. A driver whose surface maxImageCount sits below it
+        // rejects creation outright, which would be a black screen rather than a dropped
+        // generated frame — so step back to the hot-reload count, then to whatever the app
+        // originally asked for, before giving up.
+        BFG_LAYER("swapchain creation refused %u images (%d); retrying at %u",
+                  ci.minImageCount, res, kHotReloadProvisionedSwapchainImages);
+        ci.minImageCount = kHotReloadProvisionedSwapchainImages;
+        res = dd.createSwapchain(device, &ci, pAllocator, pSwapchain);
+        if (res != VK_SUCCESS && requestedMinImages < ci.minImageCount) {
+            BFG_LAYER("swapchain creation still refused (%d); retrying at the app's own %u",
+                      res, requestedMinImages);
+            ci.minImageCount = requestedMinImages;
+            res = dd.createSwapchain(device, &ci, pAllocator, pSwapchain);
+        }
+    }
     if (res != VK_SUCCESS) return res;
 
     // Get swapchain images
