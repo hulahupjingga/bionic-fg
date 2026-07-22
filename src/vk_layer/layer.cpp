@@ -218,7 +218,10 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
             } else if (key == "flow_scale" || key == "flowscale") {
                 c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(unquote(value).c_str()))));
             } else if (key == "model") {
-                c.model = std::max(0, std::min(1, std::atoi(unquote(value).c_str())));
+                // 0=model-0, 1=model-1 traced graph, 2=V2 engine (model-1 graph
+                // with libGameScopeV2.so shader variants), 3=FSR3 Optical Flow
+                // (color-only FidelityFX OF front-end -> warp/blend/synth).
+                c.model = std::max(0, std::min(3, std::atoi(unquote(value).c_str())));
             } else if (key == "fps_limit" || key == "fpslimit") {
                 int v = std::atoi(unquote(value).c_str());
                 c.fpsLimit = (v <= 0) ? 0 : v;   // respect any positive value; the UI owns the range
@@ -256,7 +259,7 @@ static LayerConf readConf() {
     if (auto* v = std::getenv("BIONIC_FG_FLOW_SCALE"))
         c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(v))));
     if (auto* v = std::getenv("BIONIC_FG_MODEL"))
-        c.model = std::max(0, std::min(1, std::atoi(v)));
+        c.model = std::max(0, std::min(3, std::atoi(v)));
     if (auto* v = std::getenv("BIONIC_FG_FPS_LIMIT")) {
         int iv = std::atoi(v);
         c.fpsLimit = (iv <= 0) ? 0 : iv;        // respect any positive value; UI owns the range
@@ -521,7 +524,7 @@ static bionic_fg::Config makeFramegenConfig(const SwapState& st, const LayerConf
     cfg.height = st.extent.height;
     cfg.multiplier = static_cast<uint32_t>(std::max(2, std::min(kMaxHotReloadMultiplier, conf.multiplier)));
     cfg.flowScale = conf.flowScale;
-    cfg.model = static_cast<uint32_t>(std::max(0, std::min(1, conf.model)));
+    cfg.model = static_cast<uint32_t>(std::max(0, std::min(3, conf.model)));
     return cfg;
 }
 
