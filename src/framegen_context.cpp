@@ -239,7 +239,11 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         // front-end (FidelityFX-SDK adaptation) that replaces model-0's flow
         // estimation (stages 1-5) but reuses the model-0 warp/blend + synthesis
         // back half (stage 6). It is additive: models 0/1/2 are unaffected.
-        const bool useModel3 = (ctx->cfg_.model == 3);
+        // model 4 ("FSR3 Optical Flow v2") reuses the same front-end structure
+        // with a per-block search, a wider window, sub-pixel refinement and a
+        // genuinely bidirectional solve. useOF covers both.
+        const bool useModel4 = (ctx->cfg_.model == 4);
+        const bool useModel3 = (ctx->cfg_.model == 3) || useModel4;
         // resolveShader: returns the V2-variant pooled index for a base role
         // index when model==2 and a mapping exists, else the base index itself.
         // Only the SPIR-V blob choice is affected; storage-format and UBO
@@ -636,8 +640,24 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         // per-shader DEVIATION comments. Resources kept in GENERAL like model 1.
         if (useModel3) {
             constexpr uint32_t kLevels = 5; // pyramid levels 0..4 (0 = full res)
+            // Model 4 solves one vector per kBlock x kBlock block (as the SDK
+            // does); model 3 keeps its original per-pixel grid, so kBlock == 1
+            // makes blockExtent == levelExtent and model 3 is bit-identical to
+            // before this pass existed. kBlock is 4 rather than the SDK's 8
+            // because FSR3 leans on game motion vectors for fine detail and a
+            // colour-only layer has none.
+            const uint32_t kBlock = useModel4 ? 4u : 1u;
+            const int flowShaderIdx = useModel4 ? embedded::kModel4FlowIdx
+                                                : embedded::kModel3FlowIdx;
+            const int expandShaderIdx = useModel4 ? embedded::kModel4ExpandIdx
+                                                  : embedded::kModel3ExpandIdx;
             auto levelExtent = [&](uint32_t lvl) -> VkExtent2D {
                 return {std::max(1u, W >> lvl), std::max(1u, H >> lvl)};
+            };
+            auto blockExtent = [&](uint32_t lvl) -> VkExtent2D {
+                const VkExtent2D e = levelExtent(lvl);
+                return {std::max(1u, (e.width  + kBlock - 1u) / kBlock),
+                        std::max(1u, (e.height + kBlock - 1u) / kBlock)};
             };
             auto groupsFor3 = [](VkExtent2D e) -> VkExtent2D {
                 return {std::max(1u, (e.width + 15u) / 16u),
@@ -663,18 +683,28 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             };
             for (uint32_t l = 0; l < kLevels; ++l) addImg(VK_FORMAT_R32_SFLOAT, levelExtent(l), false); // curr 0..4
             for (uint32_t l = 0; l < kLevels; ++l) addImg(VK_FORMAT_R32_SFLOAT, levelExtent(l), false); // prev 5..9
-            addImg(VK_FORMAT_R16G16B16A16_SFLOAT, levelExtent(kLevels - 1), true);                       // zero 10
+            addImg(VK_FORMAT_R16G16B16A16_SFLOAT, blockExtent(kLevels - 1), true);                       // zero 10
             for (int l = static_cast<int>(kLevels) - 1; l >= 1; --l)
-                addImg(VK_FORMAT_R16G16B16A16_SFLOAT, levelExtent(static_cast<uint32_t>(l)), false);     // flow 11..14
+                addImg(VK_FORMAT_R16G16B16A16_SFLOAT, blockExtent(static_cast<uint32_t>(l)), false);     // flow 11..14
             clearImageBlack(ctx->device_, ctx->cmdPool_, ctx->model3Images_[kZeroIdx]);
 
             // Per-level UBO for the 4 flow passes (levels 4,3,2,1).
             ctx->uboModel3_.reserve(kLevels - 1);
             for (int l = static_cast<int>(kLevels) - 1; l >= 1; --l) {
                 Model3UBO u; u.flowScale = cfg.flowScale; u.level = static_cast<uint32_t>(l);
-                u.pad0 = u.pad1 = 0;
+                u.occlLo = kModel3OcclLo; u.occlHi = kModel3OcclHi;
                 ctx->uboModel3_.emplace_back(ctx->device_, sizeof(Model3UBO),
                                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &u);
+            }
+            // Model 4's expand pass reads the occlusion thresholds, so it needs a
+            // real Model3UBO rather than uboFlow_ (a differently-shaped FlowUBO
+            // whose trailing floats are padding). Model 3 keeps uboFlow_ exactly
+            // as before.
+            if (useModel4) {
+                Model3UBO u; u.flowScale = cfg.flowScale; u.level = 0;
+                u.occlLo = kModel3OcclLo; u.occlHi = kModel3OcclHi;
+                ctx->uboModel3Expand_ = vk::Buffer(ctx->device_, sizeof(Model3UBO),
+                                                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &u);
             }
 
             auto addM3 = [&](int shaderIdx, const vk::Buffer* ubo,
@@ -707,19 +737,21 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 const uint32_t predIdx = (lvl == kLevels - 1)
                     ? kZeroIdx : (kFlowBase + (kLevels - 2 - lvl)); // flow of lvl+1
                 const uint32_t outIdx  = kFlowBase + (kLevels - 1 - lvl);
-                addM3(embedded::kModel3FlowIdx, &ctx->uboModel3_[uboK++],
+                addM3(flowShaderIdx, &ctx->uboModel3_[uboK++],
                       {&ctx->model3Images_[kLevels + lvl], &ctx->model3Images_[lvl],
                        &ctx->model3Images_[predIdx]},
-                      {&ctx->model3Images_[outIdx]}, levelExtent(lvl));
+                      {&ctx->model3Images_[outIdx]}, blockExtent(lvl));
             }
-            // 4) scale finest flow (level 1) to full-res forward/backward.
-            addM3(embedded::kModel3ExpandIdx, &ctx->uboFlow_,
+            // 4) scale finest flow (level 1) to full-res forward/backward. Model 4
+            //    additionally gates on forward/backward agreement.
+            addM3(expandShaderIdx, useModel4 ? &ctx->uboModel3Expand_ : &ctx->uboFlow_,
                   {&ctx->model3Images_[kFlowBase + (kLevels - 2)]},
                   {&ctx->flowExpA_, &ctx->flowExpB_}, levelExtent(0));
 
-            BFG_LOGI("model=3 FSR3 Optical Flow: %zu OF passes, %zu images, %zu level-UBOs, %u pyramid levels (-> warp/blend+synth back half)",
+            BFG_LOGI("model=%u FSR3 Optical Flow%s: %zu OF passes, %zu images, %zu level-UBOs, %u pyramid levels, block=%u (-> warp/blend+synth back half)",
+                     ctx->cfg_.model, useModel4 ? " v2 (subpixel, bidirectional, occlusion-gated)" : "",
                      ctx->model3Passes_.size(), ctx->model3Images_.size(),
-                     ctx->uboModel3_.size(), kLevels);
+                     ctx->uboModel3_.size(), kLevels, kBlock);
         }
 
         // ── Model-0 stages: skip entirely for model=1 (has its own graph above) ──
@@ -938,8 +970,9 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         BFG_LOGI("FramegenContext ready: %ux%u mult=%u model=%u graph=%s",
                   W, H, cfg.multiplier, cfg.model,
                   useModel1 ? "model1-table"
-                            : (useModel3 ? "model3-fsr3-of+warp/blend/synth"
-                                         : "model0-full-of-chain"));
+                            : (useModel4 ? "model4-fsr3-of-v2+warp/blend/synth"
+                                         : (useModel3 ? "model3-fsr3-of+warp/blend/synth"
+                                                      : "model0-full-of-chain")));
         return ctx;
     } catch (const vk::VkError& e) {
         BFG_LOGE("FramegenContext::create VkError %d: %s", e.code, e.msg.c_str());
@@ -969,7 +1002,7 @@ void FramegenContext::rebindFrameInputs() {
     // 1=prev) plus the shared stage-6 warp/blend + synth inputs. The model-0
     // pyramid/feature passes do not exist for model 3 (never built), so they
     // must NOT be touched here.
-    if (cfg_.model == 3) {
+    if (cfg_.model == 3 || cfg_.model == 4) {
         if (model3Passes_.size() >= 2) {
             model3Passes_[0].bindSampledGeneral(device_, 32, currFrame_, linearSampler_);
             model3Passes_[1].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_);
@@ -1068,7 +1101,7 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     // ── Model 3 (FSR3 OF) front-end OR model-0 stages 1-5 ────────────────────
     // Both produce flowExpA_/flowExpB_ in SHADER_READ_ONLY_OPTIMAL for the
     // shared stage-6 warp/blend + synthesis loop below.
-    const bool useModel3 = (cfg_.model == 3);
+    const bool useModel3 = (cfg_.model == 3 || cfg_.model == 4);
     if (useModel3) {
         for (auto& img : model3Images_) toStorage(cmd, img);
         toStorage(cmd, flowExpA_); toStorage(cmd, flowExpB_);
@@ -1206,6 +1239,7 @@ void FramegenContext::destroy() {
     for (auto& p:model3Passes_) p.destroy(device_); model3Passes_.clear();
     model3Dispatch_.clear();
     for (auto& b:uboModel3_) b.destroy(device_); uboModel3_.clear();
+    uboModel3Expand_.destroy(device_);
     uboPyramid_.destroy(device_); uboFlow_.destroy(device_);
     for (auto& b:uboSynth_) b.destroy(device_); uboSynth_.clear();
     // Images

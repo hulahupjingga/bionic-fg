@@ -21,7 +21,16 @@ struct SynthUBO { float flowScale; float alpha; float epsilon; };
 struct FlowUBO   { float flowScale; float pad0; float pad1; float pad2; };
 struct PyramidUBO{ uint32_t scale; uint32_t aspect; uint32_t pad0; uint32_t pad1; };
 // model 3 (FSR3 Optical Flow): per-pyramid-level uniform for the SAD flow pass.
-struct Model3UBO { float flowScale; uint32_t level; uint32_t pad0; uint32_t pad1; };
+// occlLo/occlHi are read only by model 4's expand pass (of3_expand_m4): the
+// forward/backward disagreement, relative to the claimed magnitude, at which
+// flow confidence starts to fall and at which flow is fully suppressed. Model
+// 3's shaders declare the same two words as unread padding.
+struct Model3UBO { float flowScale; uint32_t level; float occlLo; float occlHi; };
+
+// 0.6 = start distrusting once the two fields fail to cancel by more than 60%
+// of what they claim; 1.6 = suppress entirely (flow -> 0 -> cross-fade).
+inline constexpr float kModel3OcclLo = 0.6f;
+inline constexpr float kModel3OcclHi = 1.6f;
 
 // ─── Pass ────────────────────────────────────────────────────────────────────
 
@@ -172,7 +181,8 @@ private:
     std::vector<vk::Image>  model3Images_;       // luma pyramids + flow scratch
     std::vector<Pass>       model3Passes_;       // OF dispatch graph
     std::vector<VkExtent2D> model3Dispatch_;     // per-pass group counts
-    std::vector<vk::Buffer> uboModel3_;          // per-level Model3UBO
+    std::vector<vk::Buffer> uboModel3_;          // per-level Model3UBO (flow passes)
+    vk::Buffer              uboModel3Expand_;    // model 4 only: expand-pass Model3UBO
 
     // ── UBO buffers ──────────────────────────────────────────────────────────
     vk::Buffer uboPyramid_;

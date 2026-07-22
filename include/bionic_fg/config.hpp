@@ -16,6 +16,12 @@ struct Config {
     //        3 = "FSR3 Optical Flow" — a color-only FidelityFX-SDK OF front-end
     //            (luma pyramid + SAD block flow) feeding the model-0 warp/blend +
     //            synthesis back half. UNVERIFIED on device.
+    //        4 = "FSR3 Optical Flow v2" — model 3's front-end reworked: flow is
+    //            solved per block rather than per pixel (as the SDK does), which
+    //            pays for a wider match window, sub-pixel refinement and a truly
+    //            bidirectional search whose forward/backward disagreement gates
+    //            the flow at occlusion boundaries. Shares 3's luma/downsample
+    //            passes; model 3 is left untouched for A/B. UNVERIFIED on device.
     uint32_t model = 0;
 
     void sanitize() {
@@ -23,7 +29,7 @@ struct Config {
         if (multiplier > 4) multiplier = 4;
         if (flowScale < 0.2f) flowScale = 0.2f;
         if (flowScale > 1.0f) flowScale = 1.0f;
-        if (model > 3) model = 3;
+        if (model > 4) model = 4;
     }
 };
 
