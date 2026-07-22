@@ -87,6 +87,13 @@ public:
     void waitIdle();
     void destroy();
 
+    // Waits (bounded) for the compute dispatch submitted by the most recent
+    // present() call to finish, without draining every other submission on the
+    // shared queue the way waitIdle() does. Returns false on timeout (the
+    // caller must treat the dispatch's output as not-yet-ready and present the
+    // real frame only). Returns true if nothing has been submitted yet.
+    bool waitLastDispatch(uint64_t timeoutNs);
+
     bool        valid()    const { return device_.valid(); }
     std::string describe() const;
 
@@ -196,6 +203,10 @@ private:
     };
     Frame    frames_[2];
     uint32_t frameIdx_ = 0;
+
+    // Fence of the most recent present() dispatch submission. NOT owned — it
+    // aliases one of frames_[].fence. Backs waitLastDispatch().
+    VkFence  lastSubmitFence_ = VK_NULL_HANDLE;
 
 #ifdef __ANDROID__
     AHardwareBuffer* prevAhbPtr_ = nullptr;

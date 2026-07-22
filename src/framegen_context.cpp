@@ -1094,6 +1094,7 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
 
         fr.cmd.end();
         fr.cmd.submit(device_, fr.fence.handle());
+        lastSubmitFence_ = fr.fence.handle();
         frameIdx_++;
         return;
     }
@@ -1199,9 +1200,15 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
 
     fr.cmd.end();
     fr.cmd.submit(device_, fr.fence.handle());
+    lastSubmitFence_ = fr.fence.handle();
     frameIdx_++;
 }
 #endif // __ANDROID__
+
+bool FramegenContext::waitLastDispatch(uint64_t timeoutNs) {
+    if (!device_.valid() || lastSubmitFence_ == VK_NULL_HANDLE) return true;
+    return vkWaitForFences(device_.handle(), 1, &lastSubmitFence_, VK_TRUE, timeoutNs) == VK_SUCCESS;
+}
 
 void FramegenContext::updateConfig(const Config& cfg) {
     cfg_ = cfg; cfg_.sanitize();
@@ -1220,6 +1227,7 @@ void FramegenContext::waitIdle() {
 
 void FramegenContext::destroy() {
     waitIdle();
+    lastSubmitFence_ = VK_NULL_HANDLE;   // aliases a frames_[] fence about to be destroyed
     for (auto& f:frames_) { f.cmd.destroy(device_,cmdPool_); f.fence.destroy(device_); }
     auto destroyPass=[&](Pass& p){ p.destroy(device_); };
     destroyPass(passPyramidA_); destroyPass(passPyramidB_);

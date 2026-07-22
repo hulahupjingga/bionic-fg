@@ -485,6 +485,10 @@ struct SwapState {
     // disabled once either reaches kMaxFenceTimeouts.
     uint32_t copyFenceTimeouts = 0;
     uint32_t genFenceTimeouts  = 0;
+    // Consecutive timeouts waiting on the framegen compute dispatch's own
+    // completion fence (waitLastDispatch(), not the old full-queue waitIdle()).
+    // Its own counter for the same reason as the two above.
+    uint32_t dispatchFenceTimeouts = 0;
     // Sticky, runtime-only kill switch: once the present-path proves sync-
     // incompatible with this ICD we passthrough for the rest of THIS swapchain's
     // life. Kept separate from conf.enabled (which the file owns) so a conf.toml
@@ -1470,16 +1474,42 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     // --- Step 2: Run framegen after we have both previous and current inputs.
     if (st.frameCount > 0) {
         st.fgCtx->present(st.prevAhb, st.currAhb);
-        st.fgCtx->waitIdle();
+
+        // The dispatch has been SUBMITTED, so its layout/ownership transitions
+        // will land whether or not we manage to wait for them. Track them now,
+        // unconditionally — a timeout below must not leave us barriering from a
+        // stale oldLayout on the next present.
         for (auto& out : st.outProducerImgs) {
             out.layout = VK_IMAGE_LAYOUT_GENERAL;
             out.externalOwner = true;
         }
 
+        // Wait on just THIS dispatch's own completion fence rather than a full
+        // vkQueueWaitIdle() on computeQueue(). In single-device mode that queue
+        // is also the app's render queue on a GPU with one universal queue
+        // family (the common mobile case), so waitIdle() drained the game's own
+        // in-flight work on every present, not just ours.
+        //
+        // On timeout, skip only the injected frames this cycle and fall through
+        // to the real-frame present below — an early return here would skip the
+        // prevAhb/currAhb swap and frameCount++ at the end of the function and
+        // wedge the rotation.
+        const bool dispatchReady = st.fgCtx->waitLastDispatch(syncFenceTimeoutNs(st.conf));
+        if (!dispatchReady) {
+            BFG_LAYER_E("framegen dispatch fence wait timed out at sync bound (%ums); "
+                        "skipping generated frames this present",
+                        (unsigned)(syncFenceTimeoutNs(st.conf) / 1000000ull));
+            noteFenceTimeout(st, st.dispatchFenceTimeouts, "framegen-dispatch");
+        } else {
+            st.dispatchFenceTimeouts = 0;   // dispatch signalled this frame; sync working
+        }
+
         // --- Step 3: Inject generated frames. Acquire/write/present are kept
         // on distinct binary semaphores to avoid waiting and signaling the same
         // semaphore in one submit.
-        for (int k = 0; k < N; ++k) {
+        // `dispatchReady` gates the whole loop rather than wrapping it in an
+        // else-block, to keep this diff off the ~130 lines of injection body.
+        for (int k = 0; dispatchReady && k < N; ++k) {
             if (!st.acquireSems[k] || !st.presentSems[k] || !st.genCmds[k] || !st.genFences[k])
                 continue;
 
