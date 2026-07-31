@@ -183,10 +183,7 @@ static void sleepUntilNs(int64_t targetNs) {
 
 static std::string defaultConfigPath() {
     // Replace this function to use a standard unrooted Android public storage path
-static std::string defaultConfigPath() {
     return "/data/user/0/com.antutu.ABenchMark/files/bionic_fg.toml";
-}
-
 }
 
 static void parseConfigFile(const std::string& path, LayerConf& c) {
