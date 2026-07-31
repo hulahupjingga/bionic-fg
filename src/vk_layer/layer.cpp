@@ -1641,10 +1641,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetInstanceProcAddr(
     if (std::strcmp(name, "vkGetInstanceProcAddr") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(BionicFG_GetInstanceProcAddr);
     // Inside the main GetInstanceProcAddr handling block, ensure these routes exist:
-if (std::strcmp(pName, "vkEnumerateInstanceLayerProperties") == 0) {
+if (std::strcmp(Name, "vkEnumerateInstanceLayerProperties") == 0) {
     return reinterpret_cast<PFN_vkVoidFunction>(vkEnumerateInstanceLayerProperties);
 }
-if (std::strcmp(pName, "vkEnumerateDeviceLayerProperties") == 0) {
+if (std::strcmp(Name, "vkEnumerateDeviceLayerProperties") == 0) {
     return reinterpret_cast<PFN_vkVoidFunction>(vkEnumerateDeviceLayerProperties);
 }
     
