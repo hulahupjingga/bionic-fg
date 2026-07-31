@@ -182,13 +182,11 @@ static void sleepUntilNs(int64_t targetNs) {
 }
 
 static std::string defaultConfigPath() {
-    if (const char* explicitPath = std::getenv("BIONIC_FG_CONFIG")) {
-        if (explicitPath[0] != '\0') return explicitPath;
-    }
-    if (const char* home = std::getenv("HOME")) {
-        if (home[0] != '\0') return std::string(home) + "/.config/bionic-fg/conf.toml";
-    }
-    return {};
+    // Replace this function to use a standard unrooted Android public storage path
+static std::string defaultConfigPath() {
+    return "/data/user/0/com.antutu.ABenchMark/files/bionic_fg.toml";
+}
+
 }
 
 static void parseConfigFile(const std::string& path, LayerConf& c) {
@@ -249,9 +247,8 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
 
 static LayerConf readConf() {
     LayerConf c;
-
-    const char* en = std::getenv("BIONIC_FG_ENABLE");
-    c.enabled = en && en[0] == '1';
+    // Hardcode to true so it immediately runs when loaded by Eden
+    c.enabled = true; 
 
     // Backwards-compatible env fallback. A config file, when present, wins.
     if (auto* v = std::getenv("BIONIC_FG_MULTIPLIER"))
@@ -1643,6 +1640,14 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetInstanceProcAddr(
         return reinterpret_cast<PFN_vkVoidFunction>(BionicFG_GetDeviceProcAddr);
     if (std::strcmp(name, "vkGetInstanceProcAddr") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(BionicFG_GetInstanceProcAddr);
+    // Inside the main GetInstanceProcAddr handling block, ensure these routes exist:
+if (std::strcmp(pName, "vkEnumerateInstanceLayerProperties") == 0) {
+    return reinterpret_cast<PFN_vkVoidFunction>(vkEnumerateInstanceLayerProperties);
+}
+if (std::strcmp(pName, "vkEnumerateDeviceLayerProperties") == 0) {
+    return reinterpret_cast<PFN_vkVoidFunction>(vkEnumerateDeviceLayerProperties);
+}
+    
 
     if (instance == VK_NULL_HANDLE) return nullptr;
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -1658,12 +1663,62 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetInstanceProcAddr(
 
 // ─── C-linkage exports (referenced by manifest JSON) ─────────────────────────
 
-extern "C" BFG_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-BionicFG_GetInstanceProcAddr(VkInstance inst, const char* name) {
-    return bfg::layer::BionicFG_GetInstanceProcAddr(inst, name);
+// Add this directly to the bottom of src/vk_layer/layer.cpp
+
+extern "C" {
+
+BFG_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(
+    uint32_t* pPropertyCount,
+    VkLayerProperties* pProperties) 
+{
+    if (pPropertyCount == nullptr) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (pProperties == nullptr) {
+        *pPropertyCount = 1;
+        return VK_SUCCESS;
+    }
+    if (*pPropertyCount < 1) {
+        return VK_INCOMPLETE;
+    }
+
+    *pPropertyCount = 1;
+    std::strncpy(pProperties->layerName, "VK_LAYER_BIONIC_framegen", VK_MAX_EXTENSION_NAME_SIZE);
+    pProperties->specVersion = VK_MAKE_VERSION(1, 1, 0);
+    pProperties->implementationVersion = 2;
+    std::strncpy(pProperties->description, "Bionic FG Standalone Frame Generation", VK_MAX_DESCRIPTION_SIZE);
+
+    return VK_SUCCESS;
 }
 
-extern "C" BFG_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-BionicFG_GetDeviceProcAddr(VkDevice dev, const char* name) {
-    return bfg::layer::BionicFG_GetDeviceProcAddr(dev, name);
+BFG_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties(
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties) 
+{
+    if (pPropertyCount == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    *pPropertyCount = 0; // Layer does not expose custom extensions to the instance
+    return VK_SUCCESS;
 }
+
+BFG_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(
+    VkPhysicalDevice physicalDevice,
+    uint32_t* pPropertyCount,
+    VkLayerProperties* pProperties) 
+{
+    return vkEnumerateInstanceLayerProperties(pPropertyCount, pProperties);
+}
+
+BFG_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice,
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties) 
+{
+    if (pPropertyCount == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    *pPropertyCount = 0; // Layer does not expose custom extensions to the device
+    return VK_SUCCESS;
+}
+
+} // extern "C"
+
